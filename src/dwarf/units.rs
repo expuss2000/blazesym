@@ -37,6 +37,7 @@ use super::lines::Lines;
 use super::location::Location;
 use super::range::RangeAttributes;
 use super::reader::R;
+use super::unit::SupUnit;
 use super::unit::Unit;
 use super::unit::UnitRange;
 
@@ -50,6 +51,8 @@ pub(crate) struct Units<'dwarf> {
     unit_ranges: Box<[UnitRange]>,
     /// All units along with meta-data.
     units: Box<[Unit<'dwarf>]>,
+    /// All sup units along with meta-data.
+    sup_units: Box<[SupUnit<'dwarf>]>,
 }
 
 impl<'dwarf> Units<'dwarf> {
@@ -235,13 +238,37 @@ impl<'dwarf> Units<'dwarf> {
             i.max_end = max;
         }
 
+        let sup_units = if let Some(sup_section) = sections.sup() {
+            Self::parse_sup(sup_section)?
+        } else {
+            Vec::new().into_boxed_slice()
+        };
+
         let slf = Self {
             dwarf: sections,
             package,
             unit_ranges: unit_ranges.into_boxed_slice(),
             units: res_units.into_boxed_slice(),
+            sup_units,
         };
         Ok(slf)
+    }
+
+    fn parse_sup(sections: &gimli::Dwarf<R<'dwarf>>) -> Result<Box<[SupUnit<'dwarf>]>> {
+        let mut sup_units = Vec::new();
+        let mut units = sections.units();
+        while let Some(header) = units.next()? {
+            let offset = match header.debug_info_offset() {
+                Some(offset) => offset,
+                None => continue,
+            };
+            let dw_unit = match sections.unit(header) {
+                Ok(dw_unit) => dw_unit,
+                Err(_) => continue,
+            };
+            sup_units.push(SupUnit { dw_unit, offset });
+        }
+        Ok(sup_units.into_boxed_slice())
     }
 
     /// Retrieve a reference to the underlying [`gimli::Dwarf`].
@@ -289,6 +316,30 @@ impl<'dwarf> Units<'dwarf> {
             .ok_or(gimli::Error::NoEntryAtGivenOffset(offset.0 as u64))?;
         let unit_ref = unit.unit_ref(self)?;
         Ok((unit_ref, unit_offset))
+    }
+
+    /// Find the unit containing the given offset, and convert the
+    /// offset into a unit offset.
+    pub(super) fn find_unit_sup(
+        &self,
+        offset: gimli::DebugInfoOffset<<R<'_> as gimli::Reader>::Offset>,
+    ) -> gimli::Result<(
+        &gimli::Unit<R<'dwarf>>,
+        gimli::UnitOffset<<R<'dwarf> as gimli::Reader>::Offset>,
+    )> {
+        let unit = match self
+            .sup_units
+            .binary_search_by_key(&offset.0, |unit| unit.offset.0)
+        {
+            // There is never a DIE at the unit offset or before the first unit.
+            Ok(_) | Err(0) => return Err(gimli::Error::NoEntryAtGivenOffset(offset.0 as u64)),
+            Err(i) => &self.sup_units[i - 1].dw_unit,
+        };
+
+        let unit_offset = offset
+            .to_unit_offset(&unit.header)
+            .ok_or(gimli::Error::NoEntryAtGivenOffset(offset.0 as u64))?;
+        Ok((unit, unit_offset))
     }
 
     /// Finds the CUs for the function address given.
