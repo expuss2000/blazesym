@@ -33,6 +33,7 @@ use crate::inspect::SymInfo;
 use crate::log;
 use crate::log::debug;
 use crate::log::warn;
+use crate::normalize::buildid::read_build_id;
 use crate::symbolize::CodeInfo;
 use crate::symbolize::FindSymOpts;
 use crate::symbolize::InlinedFn;
@@ -47,6 +48,7 @@ use crate::ErrorKind;
 use crate::Result;
 use crate::SymType;
 
+use super::debug_altlink::read_debug_altlink;
 use super::debug_link::debug_link_crc32;
 use super::debug_link::read_debug_link;
 use super::debug_link::DebugFileIter;
@@ -184,6 +186,80 @@ fn try_deref_debug_link(
     }
 }
 
+/// Find a debug file in a list of directories.
+///
+/// `linker` is the path to the file containing the debug link. This function
+/// searches a couple of "well-known" locations and then others constructed
+/// based on the canonicalized path of `linker`.
+///
+/// # Notes
+/// This function ignores any errors encountered.
+fn find_altdebug_file(file: &OsStr, linker: Option<&Path>) -> Option<PathBuf> {
+    let canonical_linker = linker.and_then(|linker| try_canonicalize(linker).ok());
+    if let Some(canonical_linker) = canonical_linker {
+        let path = canonical_linker
+            .parent()
+            .unwrap()
+            .join(file)
+            .canonicalize()
+            .unwrap();
+        if path.exists() {
+            debug!("found altdebug info at `{}`", path.display());
+            return Some(path);
+        }
+    }
+    warn!(
+        "altdebug link references destination `{}` which was not found in any known location",
+        Path::new(file).display(),
+    );
+    None
+}
+
+fn try_deref_debug_altlink(
+    parser: &ElfParser,
+    elf_cache: Option<&FileCache<ElfResolverData>>,
+) -> Result<Option<Rc<ElfParser>>> {
+    if let Some((file, checksum)) = read_debug_altlink(parser)? {
+        // TODO: Usage of the module here is fishy, as it may not
+        //       represent an actual path. However, even using the
+        //       actual path is not necessarily correct. Consider if the
+        //       `ElfParser` references a map_files file.
+        let linker = parser.module().map(OsStr::as_ref);
+        match find_altdebug_file(file, linker) {
+            Some(path) => {
+                let tmp_parser;
+                let dst_parser = if let Some(elf_cache) = elf_cache {
+                    // TODO: Unclear whether we should provide `debug_dirs`
+                    //       here instead of `None`?
+                    elf_cache
+                        .elf_resolver(&path, None)
+                        .with_context(|| {
+                            format!("failed to open debug link destination `{}`", path.display())
+                        })?
+                        .parser()
+                } else {
+                    let parser = ElfParser::open(&path).with_context(|| {
+                        format!("failed to open debug link destination `{}`", path.display())
+                    })?;
+                    tmp_parser = Rc::new(parser);
+                    &tmp_parser
+                };
+                let build_id = read_build_id(dst_parser)?.unwrap();
+                if build_id != checksum {
+                    return Err(Error::with_invalid_data(format!(
+                        "debug link destination `{}` checksum does not match \
+                         expected one: {build_id:?} (actual) != {checksum:?} (expected)",
+                        path.display()
+                    )));
+                }
+                Ok(Some(Rc::clone(dst_parser)))
+            }
+            None => Ok(None),
+        }
+    } else {
+        Ok(None)
+    }
+}
 
 /// Try to find a DWARF package (`.dwp`) "belonging" to the file
 /// referenced by the given [`ElfParser`].
@@ -251,6 +327,7 @@ impl DwarfResolver {
         let dwp_parser = try_find_dwp(&parser, elf_cache)?;
 
         let debug_parser = linkee_parser.as_ref().unwrap_or(&parser);
+        let altlinkee_parser = try_deref_debug_altlink(debug_parser, elf_cache)?;
         // SAFETY: We own the `ElfParser` and make sure that it stays
         //         around while the `Units` object uses it. As such, it
         //         is fine to conjure a 'static lifetime here.
@@ -260,6 +337,15 @@ impl DwarfResolver {
         let mut load_section =
             |section| reader::load_section(static_linkee_parser, section, static_relocs);
         let mut dwarf = Dwarf::load(&mut load_section)?;
+        if let Some(altlinkee_parser) = altlinkee_parser {
+            let static_altlinkee_parser = unsafe {
+                mem::transmute::<&ElfParser, &'static ElfParser>(altlinkee_parser.deref())
+            };
+            let static_altrelocs = static_altlinkee_parser.section_relocations()?;
+            let mut load_altsection =
+                |section| reader::load_section(static_altlinkee_parser, section, static_altrelocs);
+            Dwarf::load_sup(&mut dwarf, &mut load_altsection)?;
+        }
         // Cache abbreviations (which will cause them to be
         // automatically reused across compilation units), which can
         // speed up parsing of debug information potentially
