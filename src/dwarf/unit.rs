@@ -55,6 +55,12 @@ pub(super) struct UnitRange {
     pub range: gimli::Range,
 }
 
+#[derive(Debug)]
+pub(super) struct SupUnit<'dwarf> {
+    pub offset: gimli::DebugInfoOffset<<R<'dwarf> as gimli::Reader>::Offset>,
+    /// The gimli unit, lazily constructed from the header.
+    pub dw_unit: gimli::Unit<R<'dwarf>>,
+}
 
 #[derive(Debug)]
 pub(super) struct Unit<'dwarf> {
