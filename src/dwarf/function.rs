@@ -103,7 +103,23 @@ fn name_attr<'dwarf>(
             let (unit, offset) = units.find_unit(offset)?;
             name_entry(unit, offset, units, recursion_limit)
         }
-        // TODO: Need to handle `AttributeValue::DebugInfoRefSup`.
+        gimli::AttributeValue::DebugInfoRefSup(offset) => {
+            if let Some(sup_sections) = unit.dwarf.sup.as_ref() {
+                let (unit, offset) = units.find_unit_sup(offset)?;
+                let unit = gimli::UnitRef::new(sup_sections, unit);
+                println!(
+                    "name_entry: {:#?}",
+                    name_entry(unit, offset, units, recursion_limit)
+                        .unwrap()
+                        .unwrap()
+                        .inner()
+                        .to_string()
+                );
+                name_entry(unit, offset, units, recursion_limit)
+            } else {
+                Ok(None)
+            }
+        }
         _ => Ok(None),
     }
 }
