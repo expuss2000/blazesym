@@ -53,7 +53,6 @@ pub(crate) fn read_build_id(parser: &ElfParser) -> Result<Option<BuildId<'_>>> {
     Ok(None)
 }
 
-
 /// Read the build ID of an ELF file located at the given path.
 ///
 /// Build IDs can have variable length, depending on which flavor is used (e.g.,

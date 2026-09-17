@@ -52,6 +52,8 @@ use super::debug_altlink::read_debug_altlink;
 use super::debug_link::debug_link_crc32;
 use super::debug_link::read_debug_link;
 use super::debug_link::DebugFileIter;
+use super::debug_suplink::read_debug_sup;
+use super::debug_suplink::read_debug_suplink;
 use super::function::Function;
 use super::location::Location;
 use super::reader;
@@ -267,6 +269,89 @@ fn try_deref_debug_altlink(
     }
 }
 
+/// Find a debug supplementary file based on the information found in a
+/// .`debug_sup` section (DWARF v.5 only);
+/// `linker` is the path to the file containing the debug link.
+///
+/// # Notes
+/// This function ignores any errors encountered.
+fn find_supdebug_file(
+    file: &OsStr,
+    linker: Option<&Path>,
+    debug_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    let canonical_linker = linker.and_then(|linker| try_canonicalize(linker).ok());
+    let build_id = canonical_linker
+        .as_ref()
+        .and_then(|linker| read_elf_build_id(linker).unwrap_or_default());
+    let it = DebugFileIter::new(debug_dirs, canonical_linker.as_deref(), file, build_id);
+    for path in it {
+        if path.exists() {
+            debug!("found debug supplementary file at `{}`", path.display());
+            return Some(path)
+        }
+    }
+    warn!(
+        "supdebug link references destination `{}` which was not found in any known location",
+        Path::new(file).display(),
+    );
+    None
+}
+
+fn try_deref_debug_suplink(
+    parser: &ElfParser,
+    elf_cache: Option<&FileCache<ElfResolverData>>,
+    debug_dirs: &[PathBuf],
+) -> Result<Option<Rc<ElfParser>>> {
+    if let Some((file, checksum)) = read_debug_suplink(parser)? {
+        // TODO: Usage of the module here is fishy, as it may not
+        //       represent an actual path. However, even using the
+        //       actual path is not necessarily correct. Consider if the
+        //       `ElfParser` references a map_files file.
+        let linker = parser.module().map(OsStr::as_ref);
+        match find_supdebug_file(file, linker, debug_dirs) {
+            Some(path) => {
+                let tmp_parser;
+                let dst_parser = if let Some(elf_cache) = elf_cache {
+                    // TODO: Unclear whether we should provide `debug_dirs`
+                    //       here instead of `None`?
+                    elf_cache
+                        .elf_resolver(&path, None)
+                        .with_context(|| {
+                            format!(
+                                "failed to open debug suplink destination `{}`",
+                                path.display()
+                            )
+                        })?
+                        .parser()
+                } else {
+                    let parser = ElfParser::open(&path).with_context(|| {
+                        format!(
+                            "failed to open debug suplink destination `{}`",
+                            path.display()
+                        )
+                    })?;
+                    tmp_parser = Rc::new(parser);
+                    &tmp_parser
+                };
+
+                let build_id = read_debug_sup(dst_parser)?.unwrap();
+                if build_id != checksum {
+                    return Err(Error::with_invalid_data(format!(
+                        "debug suplink destination `{}` checksum does not match \
+                         expected one: {build_id:?} (actual) != {checksum:?} (expected)",
+                        path.display()
+                    )));
+                }
+                Ok(Some(Rc::clone(dst_parser)))
+            }
+            None => Ok(None),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 /// Try to find a DWARF package (`.dwp`) "belonging" to the file
 /// referenced by the given [`ElfParser`].
 fn try_find_dwp(
@@ -334,15 +419,20 @@ impl DwarfResolver {
 
         let debug_parser = linkee_parser.as_ref().unwrap_or(&parser);
         let altlinkee_parser = try_deref_debug_altlink(debug_parser, elf_cache)?;
+
+        let suplinkee_parser = try_deref_debug_suplink(debug_parser, elf_cache, debug_dirs)?;
+
         // SAFETY: We own the `ElfParser` and make sure that it stays
         //         around while the `Units` object uses it. As such, it
         //         is fine to conjure a 'static lifetime here.
+
         let static_linkee_parser =
             unsafe { mem::transmute::<&ElfParser, &'static ElfParser>(debug_parser.deref()) };
         let static_relocs = static_linkee_parser.section_relocations()?;
         let mut load_section =
             |section| reader::load_section(static_linkee_parser, section, static_relocs);
         let mut dwarf = Dwarf::load(&mut load_section)?;
+
         if let Some(altlinkee_parser) = altlinkee_parser {
             let static_altlinkee_parser = unsafe {
                 mem::transmute::<&ElfParser, &'static ElfParser>(altlinkee_parser.deref())
@@ -351,7 +441,17 @@ impl DwarfResolver {
             let mut load_altsection =
                 |section| reader::load_section(static_altlinkee_parser, section, static_altrelocs);
             Dwarf::load_sup(&mut dwarf, &mut load_altsection)?;
+        } else if let Some(suplinkee_parser) = suplinkee_parser {
+            // DWARF v.5
+            let static_suplinkee_parser = unsafe {
+                mem::transmute::<&ElfParser, &'static ElfParser>(suplinkee_parser.deref())
+            };
+            let static_suprelocs = static_suplinkee_parser.section_relocations()?;
+            let mut load_supsection =
+                |section| reader::load_section(static_suplinkee_parser, section, static_suprelocs);
+            Dwarf::load_sup(&mut dwarf, &mut load_supsection)?;
         }
+
         // Cache abbreviations (which will cause them to be
         // automatically reused across compilation units), which can
         // speed up parsing of debug information potentially
